@@ -254,8 +254,13 @@ A:
 
 ## 测试环境
 
-- ✅ IDA Pro 9.1
-- ✅ IDA Pro 7.7
+- ✅ IDA Pro 9.2
+
+```
+mac ida pro 9.2 Python
+ 
+/Applications/IDA\ Professional\ 9.2.app/Contents/MacOS/idapyswitch --force-path /Users/wzb/.pyenv/versions/3.11.10/lib/libpython3.11.dylib             15:06:38
+```
 
 ## 技术特点
 

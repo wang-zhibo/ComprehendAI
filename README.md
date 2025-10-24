@@ -82,7 +82,19 @@ pip install openai
 
 #### 4. Launch IDA and Load the Plugin
 
-It has been successfully tested in IDA 9.1 and IDA 7.7.
+It has been successfully tested in IDA 9.2
+
+```
+mac ida pro 9.2 配置 Python
+1
+2
+3
+4
+5
+ida pro 9.2 Python
+ 
+/Applications/IDA\ Professional\ 9.2.app/Contents/MacOS/idapyswitch --force-path /Users/wzb/.pyenv/versions/3.11.10/lib/libpython3.11.dylib             15:06:38
+```
 
 ###  Example
 
