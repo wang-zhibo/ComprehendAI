@@ -1,0 +1,7 @@
+{
+    "openai": {
+        "model": "deepseek-v3.1:671b-cloud",
+        "api_key": "1a86dbf1e3594547854628ba3cdace39.eVgh6lKunDSUxnlU4F6yM-yS",
+        "base_url": "https://ollama.com/v1"
+    }
+}
