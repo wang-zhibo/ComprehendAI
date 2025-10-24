@@ -2,6 +2,8 @@
 
 An AI plugin for assisting IDA reverse analysis, which facilitates quickly summarizing the functions of code and accelerates the analysis efficiency.
 
+> **最新更新（2025-10-24）**: 代码已全面优化，包括更完善的错误处理、更友好的中文提示、更美观的输出格式。详见 [OPTIMIZATION_NOTES.md](./OPTIMIZATION_NOTES.md) 和 [CODE_COMPARISON.md](./CODE_COMPARISON.md)
+
 ## Features
 
 **Non - blocking AI Analysis**
@@ -42,22 +44,22 @@ Open the `config.json` file. You will see a content structure similar to the fol
 
 ```json
 {
-    "openai"{
-        "model":"",
+    "openai": {
+        "model": "",
         "api_key": "",
         "base_url": ""
     }
 }
 ```
 
-Replace the content within the double - quotes with your own `api_key` and `base_url`. For example:
+Replace the content within the double - quotes with your own `model`, `api_key` and `base_url`. For example:
 
 ```json
 {
-    "openai"{
-        "model":"",
+    "openai": {
+        "model": "gpt-4",
         "api_key": "your_actual_api_key",
-        "base_url": "your_actual_base_url"
+        "base_url": "https://api.openai.com/v1"
     }
 }
 ```
