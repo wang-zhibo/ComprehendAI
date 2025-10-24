@@ -29,7 +29,7 @@ An AI plugin for assisting IDA reverse analysis, which facilitates quickly summa
 First, you need to pull the project to your local machine. Open your terminal or command prompt and use the following command to clone the project repository:
 
 ```bash
-git clone https://github.com/Kvancy/ComprehendAI.git
+git clone https://github.com/wang-zhibo/ComprehendAI.git
 ```
 
 #### 2. File Placement
