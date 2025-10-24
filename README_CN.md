@@ -43,6 +43,13 @@ git clone https://github.com/wang-zhibo/ComprehendAI.git
 
 进入克隆的项目目录，找到 `ComprehendAI.py` 文件，将其放入 IDA 的 `plugins` 文件夹中。
 
+```
+path
+🦉 [plugins] pwd                                                            15:59:06
+/Applications/IDA Professional 9.2.app/Contents/MacOS/plugins
+🦉 [plugins] cp ~/wangzhib_githubs/ComprehendAI/ComprehendAI.py .
+```
+
 **重要提示**：不要直接使用 `config_sample.json`，而是需要创建自己的 `config.json` 文件。
 
 ### 3. 配置文件设置
