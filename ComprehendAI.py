@@ -1,6 +1,8 @@
 """
 ComprehendAI - IDA Pro AI 分析插件
 基于 OpenAI API 的智能逆向工程分析工具
+
+优化版本 - 包含增强的日志、错误处理和性能优化
 """
 import traceback
 import idaapi
@@ -13,9 +15,12 @@ import json
 import os
 import hashlib
 import time
+import logging
+import sys
 from datetime import datetime
-from typing import Optional, Set, List, Dict, Tuple
+from typing import Optional, Set, List, Dict, Tuple, Callable
 from pathlib import Path
+from functools import wraps
 
 from idaapi import action_handler_t, UI_Hooks
 from threading import Lock, Thread, Event
@@ -46,7 +51,136 @@ DEFAULT_MAX_DEPTH = 2
 DEFAULT_ANALYSIS_DEPTH = 2
 CACHE_DIR = 'comprehendai_cache'
 EXPORT_DIR = 'comprehendai_exports'
+LOG_DIR = 'comprehendai_logs'
 MAX_CACHE_SIZE = 100  # 最大缓存条目数
+DEFAULT_REQUEST_TIMEOUT = 300  # 默认请求超时时间（秒）
+MAX_RETRY_COUNT = 3  # 最大重试次数
+
+
+class Logger:
+    """
+    统一日志管理器
+    提供格式化的日志输出和文件记录
+    """
+    _instance = None
+    _lock = Lock()
+    
+    def __new__(cls):
+        with cls._lock:
+            if not cls._instance:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialize()
+            return cls._instance
+    
+    def _initialize(self):
+        """初始化日志系统"""
+        script_dir = Path(__file__).parent
+        log_dir = script_dir / LOG_DIR
+        log_dir.mkdir(exist_ok=True)
+        
+        # 创建日志文件
+        log_file = log_dir / f"comprehendai_{datetime.now().strftime('%Y%m%d')}.log"
+        
+        # 配置日志格式
+        self.logger = logging.getLogger('ComprehendAI')
+        self.logger.setLevel(logging.DEBUG)
+        
+        # 文件处理器
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        file_handler.setFormatter(file_formatter)
+        
+        # 控制台处理器（IDA 输出窗口）
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.INFO)
+        console_formatter = logging.Formatter('%(message)s')
+        console_handler.setFormatter(console_formatter)
+        
+        # 避免重复添加处理器
+        if not self.logger.handlers:
+            self.logger.addHandler(file_handler)
+            self.logger.addHandler(console_handler)
+    
+    def info(self, msg: str, emoji: str = "ℹ️"):
+        """信息日志"""
+        self.logger.info(f"{emoji} {msg}")
+    
+    def success(self, msg: str):
+        """成功日志"""
+        self.logger.info(f"✅ {msg}")
+    
+    def warning(self, msg: str):
+        """警告日志"""
+        self.logger.warning(f"⚠️ {msg}")
+    
+    def error(self, msg: str, exc_info=False):
+        """错误日志"""
+        self.logger.error(f"❌ {msg}", exc_info=exc_info)
+    
+    def debug(self, msg: str):
+        """调试日志"""
+        self.logger.debug(f"🔍 {msg}")
+    
+    def section(self, title: str, char: str = "=", width: int = 80):
+        """输出分隔区域"""
+        self.logger.info(f"\n{char * width}")
+        self.logger.info(f"{title}")
+        self.logger.info(f"{char * width}\n")
+
+
+def retry_on_failure(max_retries: int = MAX_RETRY_COUNT, delay: float = 1.0):
+    """
+    重试装饰器 - 用于API调用失败时自动重试
+    
+    Args:
+        max_retries: 最大重试次数
+        delay: 重试延迟（秒）
+    """
+    def decorator(func: Callable):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            logger = Logger()
+            last_exception = None
+            
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        logger.warning(f"操作失败，{delay}秒后重试 ({attempt + 1}/{max_retries}): {str(e)}")
+                        time.sleep(delay)
+                    else:
+                        logger.error(f"重试{max_retries}次后仍然失败: {str(e)}")
+            
+            raise last_exception
+        return wrapper
+    return decorator
+
+
+def safe_execute(default_return=None, log_error: bool = True):
+    """
+    安全执行装饰器 - 捕获异常并返回默认值
+    
+    Args:
+        default_return: 发生异常时的默认返回值
+        log_error: 是否记录错误日志
+    """
+    def decorator(func: Callable):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                if log_error:
+                    logger = Logger()
+                    logger.error(f"{func.__name__} 执行失败: {str(e)}", exc_info=True)
+                return default_return
+        return wrapper
+    return decorator
 
 
 class ConfigManager:
@@ -66,6 +200,7 @@ class ConfigManager:
     
     def _initialize(self):
         """初始化配置管理器"""
+        self.logger = Logger()
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.config_path = os.path.join(self.script_dir, CONFIG_FILENAME)
         self.config = self._load_config()
@@ -83,14 +218,16 @@ class ConfigManager:
         """
         try:
             if not os.path.exists(self.config_path):
-                raise FileNotFoundError(
+                error_msg = (
                     f"配置文件不存在: {self.config_path}\n"
                     f"请参考 config_sample.json 创建 config.json"
                 )
+                self.logger.error(error_msg)
+                raise FileNotFoundError(error_msg)
             
             with open(self.config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
-                
+            
             # 验证必要的配置项
             if "openai" not in config:
                 raise KeyError("配置文件缺少 'openai' 配置项")
@@ -99,15 +236,22 @@ class ConfigManager:
             for key in required_keys:
                 if key not in config["openai"]:
                     raise KeyError(f"配置文件缺少 'openai.{key}' 配置项")
-                    
+            
+            self.logger.debug(f"配置文件加载成功: {self.config_path}")
+            self.logger.debug(f"使用模型: {config['openai']['model']}")
+            
             return config
             
         except FileNotFoundError as e:
             raise RuntimeError(str(e))
         except json.JSONDecodeError as e:
-            raise RuntimeError(f"配置文件 JSON 格式错误: {str(e)}")
+            error_msg = f"配置文件 JSON 格式错误: {str(e)}"
+            self.logger.error(error_msg)
+            raise RuntimeError(error_msg)
         except Exception as e:
-            raise RuntimeError(f"加载配置文件失败: {str(e)}")
+            error_msg = f"加载配置文件失败: {str(e)}"
+            self.logger.error(error_msg, exc_info=True)
+            raise RuntimeError(error_msg)
     
     def _create_openai_client(self) -> OpenAI:
         """
@@ -116,10 +260,17 @@ class ConfigManager:
         Returns:
             OpenAI: OpenAI 客户端实例
         """
-        return OpenAI(
-            api_key=self.config["openai"]["api_key"],
-            base_url=self.config["openai"]["base_url"]
-        )
+        try:
+            client = OpenAI(
+                api_key=self.config["openai"]["api_key"],
+                base_url=self.config["openai"]["base_url"],
+                timeout=self.config["openai"].get("timeout", DEFAULT_REQUEST_TIMEOUT)
+            )
+            self.logger.debug("OpenAI 客户端创建成功")
+            return client
+        except Exception as e:
+            self.logger.error(f"创建 OpenAI 客户端失败: {str(e)}", exc_info=True)
+            raise
     
     @property
     def model_name(self) -> str:
@@ -130,6 +281,16 @@ class ConfigManager:
     def client(self) -> OpenAI:
         """获取 OpenAI 客户端"""
         return self.openai_client
+    
+    @property
+    def request_timeout(self) -> int:
+        """获取请求超时时间"""
+        return self.config["openai"].get("timeout", DEFAULT_REQUEST_TIMEOUT)
+    
+    @property
+    def max_retries(self) -> int:
+        """获取最大重试次数"""
+        return self.config.get("max_retries", MAX_RETRY_COUNT)
 
 
 class CacheManager:
@@ -140,6 +301,7 @@ class CacheManager:
     
     def __init__(self):
         """初始化缓存管理器"""
+        self.logger = Logger()
         self.cache: Dict[str, Dict] = {}
         self._lock = Lock()
         self.cache_dir = self._get_cache_dir()
@@ -154,7 +316,7 @@ class CacheManager:
     
     def _generate_cache_key(self, func_ea: int, code: str) -> str:
         """
-        生成缓存键
+        生成缓存键（优化版本 - 使用 SHA256）
         
         Args:
             func_ea: 函数地址
@@ -163,9 +325,10 @@ class CacheManager:
         Returns:
             str: 缓存键（哈希值）
         """
-        content = f"{func_ea}_{code}"
-        return hashlib.md5(content.encode()).hexdigest()
+        # 只使用代码哈希，地址作为元数据存储
+        return hashlib.sha256(code.encode('utf-8')).hexdigest()
     
+    @safe_execute(default_return=None, log_error=True)
     def get(self, func_ea: int, code: str) -> Optional[str]:
         """
         获取缓存的分析结果
@@ -184,14 +347,17 @@ class CacheManager:
                 cache_entry = self.cache[cache_key]
                 # 检查缓存是否过期（24小时）
                 if time.time() - cache_entry['timestamp'] < 86400:
-                    print(f"📦 使用缓存结果 (函数: {hex(func_ea)})")
+                    self.logger.info(f"使用缓存结果 (函数: {hex(func_ea)})", emoji="📦")
+                    self.logger.debug(f"缓存键: {cache_key[:16]}...")
                     return cache_entry['result']
                 else:
                     # 删除过期缓存
                     del self.cache[cache_key]
+                    self.logger.debug(f"删除过期缓存: {cache_key[:16]}...")
         
         return None
     
+    @safe_execute(log_error=True)
     def set(self, func_ea: int, code: str, result: str):
         """
         保存分析结果到缓存
@@ -216,9 +382,13 @@ class CacheManager:
                 oldest_key = min(self.cache.keys(), 
                                key=lambda k: self.cache[k]['timestamp'])
                 del self.cache[oldest_key]
+                self.logger.debug(f"缓存已满，删除最旧条目: {oldest_key[:16]}...")
+            
+            self.logger.debug(f"保存缓存: {cache_key[:16]}... (总计: {len(self.cache)} 条)")
         
         self._save_cache()
     
+    @safe_execute(log_error=True)
     def _load_cache(self):
         """从文件加载缓存"""
         cache_file = self.cache_dir / 'cache.json'
@@ -226,26 +396,57 @@ class CacheManager:
             try:
                 with open(cache_file, 'r', encoding='utf-8') as f:
                     self.cache = json.load(f)
-                print(f"📦 已加载 {len(self.cache)} 条缓存记录")
+                
+                # 清理过期缓存
+                current_time = time.time()
+                expired_keys = [
+                    key for key, entry in self.cache.items()
+                    if current_time - entry.get('timestamp', 0) >= 86400
+                ]
+                for key in expired_keys:
+                    del self.cache[key]
+                
+                if expired_keys:
+                    self.logger.info(f"清理了 {len(expired_keys)} 条过期缓存", emoji="🧹")
+                
+                self.logger.info(f"已加载 {len(self.cache)} 条缓存记录", emoji="📦")
             except Exception as e:
-                print(f"⚠️ 加载缓存失败: {e}")
+                self.logger.warning(f"加载缓存失败: {e}")
                 self.cache = {}
     
+    @safe_execute(log_error=True)
     def _save_cache(self):
         """保存缓存到文件"""
         cache_file = self.cache_dir / 'cache.json'
         try:
-            with open(cache_file, 'w', encoding='utf-8') as f:
+            # 使用临时文件确保原子性写入
+            temp_file = cache_file.with_suffix('.tmp')
+            with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(self.cache, f, ensure_ascii=False, indent=2)
+            temp_file.replace(cache_file)
         except Exception as e:
-            print(f"⚠️ 保存缓存失败: {e}")
+            self.logger.warning(f"保存缓存失败: {e}")
     
     def clear(self):
         """清空所有缓存"""
         with self._lock:
+            cache_count = len(self.cache)
             self.cache.clear()
         self._save_cache()
-        print("🗑️ 缓存已清空")
+        self.logger.info(f"缓存已清空 (删除了 {cache_count} 条记录)", emoji="🗑️")
+    
+    def get_stats(self) -> Dict[str, any]:
+        """获取缓存统计信息"""
+        with self._lock:
+            total_size = sum(
+                len(entry['result']) 
+                for entry in self.cache.values()
+            )
+            return {
+                'count': len(self.cache),
+                'total_size_kb': total_size / 1024,
+                'max_size': MAX_CACHE_SIZE
+            }
 
 
 class ContextExtractor:
@@ -467,6 +668,7 @@ class ResultExporter:
     
     def __init__(self):
         """初始化导出器"""
+        self.logger = Logger()
         self.export_dir = self._get_export_dir()
     
     def _get_export_dir(self) -> Path:
@@ -476,6 +678,7 @@ class ResultExporter:
         export_dir.mkdir(exist_ok=True)
         return export_dir
     
+    @safe_execute(default_return="", log_error=True)
     def export_result(self, func_name: str, func_addr: str, 
                      result: str, code: str = "") -> str:
         """
@@ -491,7 +694,9 @@ class ResultExporter:
             str: 导出的文件路径
         """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{func_name}_{func_addr}_{timestamp}.md"
+        # 清理函数名中的特殊字符
+        safe_func_name = "".join(c for c in func_name if c.isalnum() or c in ('_', '-'))
+        filename = f"{safe_func_name}_{func_addr}_{timestamp}.md"
         filepath = self.export_dir / filename
         
         content = f"""# ComprehendAI 分析报告
@@ -500,6 +705,7 @@ class ResultExporter:
 - **函数名**: {func_name}
 - **地址**: {func_addr}
 - **分析时间**: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+- **生成工具**: ComprehendAI v2.0
 
 ## 分析结果
 
@@ -516,13 +722,11 @@ class ResultExporter:
 ```
 """
         
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(content)
-            return str(filepath)
-        except Exception as e:
-            print(f"❌ 导出失败: {e}")
-            return ""
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        self.logger.debug(f"结果已导出到: {filepath}")
+        return str(filepath)
 
 
 class DisassemblyProcessor:
@@ -539,6 +743,7 @@ class DisassemblyProcessor:
             max_depth: 最大分析深度,控制递归提取子函数的层数
             extract_context: 是否提取额外上下文信息（字符串、常量等）
         """
+        self.logger = Logger()
         self.max_depth = max_depth
         self.extract_context = extract_context
         self._lock = Lock()
@@ -551,6 +756,7 @@ class DisassemblyProcessor:
             self.processed_funcs: Set[int] = set()
             self.func_disasm_list: List[str] = []
             self.main_func_ea: Optional[int] = None
+            self.failed_funcs: List[Tuple[int, str]] = []  # 记录失败的函数
     
     def get_current_function_disasm(self, include_context: bool = True) -> Tuple[str, int]:
         """
@@ -566,25 +772,46 @@ class DisassemblyProcessor:
             ValueError: 无法定位函数起始地址
         """
         self._reset_state()
+        start_time = time.time()
         
         current_ea = idc.get_screen_ea()
         func_start = idc.get_func_attr(current_ea, idc.FUNCATTR_START)
         
         if func_start == idaapi.BADADDR:
-            raise ValueError("无法定位函数起始地址,请确保光标位于有效函数内")
+            error_msg = "无法定位函数起始地址，请确保光标位于有效函数内"
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        func_name = idc.get_func_name(func_start)
+        self.logger.info(f"开始提取函数代码: {func_name} ({hex(func_start)})", emoji="📝")
+        self.logger.debug(f"分析深度: {self.max_depth}")
         
         self.main_func_ea = func_start
         
         # 提取上下文信息
         context_info = ""
         if include_context and self.extract_context:
+            self.logger.debug("提取上下文信息...")
             context_info = self._build_context_info(func_start)
         
         # 处理函数及其子函数
         self._process_function(func_start, self.max_depth)
         
         if not self.func_disasm_list:
-            raise ValueError("未能提取到任何反编译代码")
+            error_msg = "未能提取到任何反编译代码"
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        elapsed = time.time() - start_time
+        self.logger.success(
+            f"代码提取完成: {len(self.func_disasm_list)} 个函数, "
+            f"耗时 {elapsed:.2f} 秒"
+        )
+        
+        if self.failed_funcs:
+            self.logger.warning(f"有 {len(self.failed_funcs)} 个函数反编译失败")
+            for ea, error in self.failed_funcs[:5]:  # 只显示前5个
+                self.logger.debug(f"  - {hex(ea)}: {error}")
         
         result = context_info + "\n\n" + "=" * 80 + "\n\n".join(self.func_disasm_list)
         return result, func_start
@@ -644,10 +871,12 @@ class DisassemblyProcessor:
         with self._lock:
             self.processed_funcs.add(func_ea)
         
+        func_name = idc.get_func_name(func_ea)
+        
         try:
             # 尝试反编译函数
+            self.logger.debug(f"反编译: {func_name} ({hex(func_ea)}), 深度={depth}")
             decompiled = str(idaapi.decompile(func_ea))
-            func_name = idc.get_func_name(func_ea)
             
             # 添加函数标识信息
             header = f"\n{'=' * 80}\n函数: {func_name} (地址: {hex(func_ea)})\n{'=' * 80}\n"
@@ -656,13 +885,19 @@ class DisassemblyProcessor:
                 self.func_disasm_list.append(header + decompiled)
                 
         except Exception as e:
-            print(f"❌ 反编译失败 {hex(func_ea)}: {str(e)}")
+            error_msg = f"反编译失败: {str(e)}"
+            self.logger.warning(f"{func_name} ({hex(func_ea)}): {error_msg}")
+            with self._lock:
+                self.failed_funcs.append((func_ea, error_msg))
             return
         
         # 递归处理子函数
         if depth > 0:
-            for callee in self._get_callees(func_ea):
-                self._process_function(callee, depth - 1)
+            callees = self._get_callees(func_ea)
+            if callees:
+                self.logger.debug(f"{func_name} 调用了 {len(callees)} 个子函数")
+                for callee in callees:
+                    self._process_function(callee, depth - 1)
     
     def _get_callees(self, func_ea: int) -> Set[int]:
         """
@@ -698,8 +933,10 @@ class AIService:
     def __init__(self):
         """初始化 AI 服务"""
         self.config = ConfigManager()
+        self.logger = Logger()
         self.stop_event = Event()
         self.last_result = ""  # 保存最后一次分析结果
+        self.last_token_usage = {}  # 保存最后一次的 token 使用情况
 
     def ask_ai(self, prompt: str, ai_isRunning: Lock, 
               func_ea: int = 0, code: str = "", 
@@ -718,38 +955,55 @@ class AIService:
             Tuple[QueryStatus, str]: (查询状态, 结果文本)
         """
         messages = [{"role": "user", "content": prompt}]
-        print("\n" + "=" * 80)
-        print("ComprehendAI 输出:")
-        print("=" * 80 + "\n")
+        self.logger.section("ComprehendAI 输出")
         
         self.stop_event.clear()  # 初始化停止事件
         
         try:
-            result, answer = self._request_openai(messages)
+            result, answer = self._request_openai_with_retry(messages)
             self.last_result = answer  # 保存结果
             return result, answer
+        except Exception as e:
+            self.logger.error(f"AI 请求发生未捕获异常: {str(e)}", exc_info=True)
+            return QueryStatus.FAILED, ""
         finally:
             # 确保无论成功失败都释放锁
             ai_isRunning.release()
 
-        # 输出最终状态
-        match result:
-            case QueryStatus.SUCCESS:
-                print("\n" + "=" * 80)
-                print("✅ 分析完成！")
-                print("=" * 80)
-            case QueryStatus.FAILED:
-                print("\n" + "=" * 80)
-                print("❌ 分析失败，请检查配置或网络连接")
-                print("=" * 80)
-            case QueryStatus.STOPPED:
-                print("\n" + "=" * 80)
-                print("⏸️ 分析已停止")
-                print("=" * 80)
-
+    def _request_openai_with_retry(self, messages: List[dict]) -> Tuple[QueryStatus, str]:
+        """
+        带重试机制的 OpenAI API 请求
+        
+        Args:
+            messages: 消息列表
+            
+        Returns:
+            Tuple[QueryStatus, str]: (查询状态, 回答内容)
+        """
+        max_retries = self.config.max_retries
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                return self._request_openai(messages)
+            except Exception as e:
+                last_error = e
+                # 如果是用户主动停止，不重试
+                if self.stop_event.is_set():
+                    return QueryStatus.STOPPED, ""
+                
+                if attempt < max_retries - 1:
+                    delay = 2 ** attempt  # 指数退避
+                    self.logger.warning(f"API 请求失败，{delay}秒后重试 ({attempt + 1}/{max_retries}): {str(e)}")
+                    time.sleep(delay)
+                else:
+                    self.logger.error(f"API 请求重试{max_retries}次后仍然失败")
+        
+        return QueryStatus.FAILED, ""
+    
     def _request_openai(self, messages: List[dict]) -> Tuple[QueryStatus, str]:
         """
-        请求 OpenAI API
+        请求 OpenAI API（改进版本 - 更好的流式输出）
         
         Args:
             messages: 消息列表
@@ -760,8 +1014,11 @@ class AIService:
         reasoning_content = ""
         answer_content = ""
         is_answering = False
+        start_time = time.time()
         
         try:
+            self.logger.debug(f"开始 API 请求，模型: {self.config.model_name}")
+            
             completion = self.config.client.chat.completions.create(
                 model=self.config.model_name,
                 messages=messages,
@@ -771,56 +1028,68 @@ class AIService:
             for chunk in completion:
                 # 检查是否需要停止
                 if self.stop_event.is_set():
-                    print("\n\n🛑 收到停止信号,正在中断...")
+                    self.logger.info("收到停止信号，正在中断...", emoji="🛑")
                     return QueryStatus.STOPPED, answer_content
 
                 # 处理 usage 信息
                 if not chunk.choices:
                     if hasattr(chunk, 'usage') and chunk.usage:
-                        print(f"\n\n📊 Token 使用情况: {chunk.usage}")
+                        self.last_token_usage = {
+                            'prompt_tokens': getattr(chunk.usage, 'prompt_tokens', 0),
+                            'completion_tokens': getattr(chunk.usage, 'completion_tokens', 0),
+                            'total_tokens': getattr(chunk.usage, 'total_tokens', 0)
+                        }
+                        self.logger.info(
+                            f"Token 使用: 提示 {self.last_token_usage['prompt_tokens']}, "
+                            f"回复 {self.last_token_usage['completion_tokens']}, "
+                            f"总计 {self.last_token_usage['total_tokens']}", 
+                            emoji="📊"
+                        )
                     continue
                 
                 delta = chunk.choices[0].delta
                 
-                # 处理推理内容(如果模型支持)
+                # 处理推理内容(如果模型支持，如 o1 系列)
                 if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                    if not reasoning_content:
+                        self.logger.info("=" * 20 + " 推理过程 " + "=" * 20, emoji="🤔")
                     print(delta.reasoning_content, end='', flush=True)
                     reasoning_content += delta.reasoning_content
                 
                 # 处理回复内容
                 elif delta.content is not None:
                     if not is_answering and delta.content:
-                        print("\n" + "=" * 20 + " 完整回复 " + "=" * 20 + "\n")
+                        if reasoning_content:
+                            print("\n")  # 推理内容后换行
+                        self.logger.info("=" * 20 + " 完整回复 " + "=" * 20, emoji="💡")
                         is_answering = True
+                    print(delta.content, end='', flush=True)
                     answer_content += delta.content
             
-            # 打印完整回复
+            # 计算耗时
+            elapsed_time = time.time() - start_time
+            
+            # 打印完整回复（如果还没打印过）
             if answer_content:
-                print(answer_content)
-                print("\n" + "=" * 80)
-                print("✅ 分析完成！")
-                print("=" * 80)
+                if is_answering:
+                    print("\n")  # 确保结束时换行
+                self.logger.section("分析完成！")
+                self.logger.info(f"耗时: {elapsed_time:.2f} 秒", emoji="⏱️")
+                self.logger.debug(f"回复长度: {len(answer_content)} 字符")
                 return QueryStatus.SUCCESS, answer_content
             else:
-                print("⚠️ AI 未返回有效内容")
+                self.logger.warning("AI 未返回有效内容")
                 return QueryStatus.FAILED, ""
         
         except StopIteration as e:
-            print(f"\n⚠️ 迭代被中断: {e}")
-            print("\n" + "=" * 80)
-            print("⏸️ 分析已停止")
-            print("=" * 80)
+            self.logger.info("迭代被中断", emoji="⏸️")
             return QueryStatus.STOPPED, answer_content
 
         except Exception as e:
-            print(f"\n❌ 发生错误: {e}")
+            self.logger.error(f"API 请求错误: {str(e)}", exc_info=True)
             if hasattr(e, '__class__'):
-                print(f"错误类型: {e.__class__.__name__}")
-            traceback.print_exc()
-            print("\n" + "=" * 80)
-            print("❌ 分析失败，请检查配置或网络连接")
-            print("=" * 80)
-            return QueryStatus.FAILED, ""
+                self.logger.debug(f"错误类型: {e.__class__.__name__}")
+            raise  # 重新抛出异常以便重试机制处理
 
 
 # 默认分析提示词模板
@@ -856,6 +1125,7 @@ class AnalysisHandler:
 
     def __init__(self):
         """初始化分析处理器"""
+        self.logger = Logger()
         self.disassembler = DisassemblyProcessor()
         self.ai_service = AIService()
         self.ai_isRunning = Lock()
@@ -866,6 +1136,7 @@ class AnalysisHandler:
         self.auto_export = False  # 是否自动导出结果
         self.last_func_ea = 0
         self.last_code = ""
+        self.analysis_count = 0  # 分析计数
         
     def set_analysis_depth(self, depth: int):
         """
@@ -875,32 +1146,55 @@ class AnalysisHandler:
             depth: 分析深度(子函数递归层数)
         """
         if depth < 0:
-            print("❌ 分析深度必须大于等于 0")
+            self.logger.error("分析深度必须大于等于 0")
             return
             
         self.disassembler.max_depth = depth
-        print(f"✅ 分析深度已设置为: {depth}")
+        self.logger.success(f"分析深度已设置为: {depth}")
     
     def toggle_cache(self):
         """切换缓存开关"""
         self.use_cache = not self.use_cache
         status = "启用" if self.use_cache else "禁用"
-        print(f"🔧 缓存已{status}")
+        self.logger.info(f"缓存已{status}", emoji="🔧")
     
     def toggle_auto_export(self):
         """切换自动导出开关"""
         self.auto_export = not self.auto_export
         status = "启用" if self.auto_export else "禁用"
-        print(f"🔧 自动导出已{status}")
+        self.logger.info(f"自动导出已{status}", emoji="🔧")
     
     def clear_cache(self):
         """清空缓存"""
         self.cache_manager.clear()
     
+    def show_cache_stats(self):
+        """显示缓存统计信息"""
+        stats = self.cache_manager.get_stats()
+        self.logger.section("缓存统计信息")
+        self.logger.info(f"缓存条目数: {stats['count']}/{stats['max_size']}")
+        self.logger.info(f"总大小: {stats['total_size_kb']:.2f} KB")
+    
+    def show_stats(self):
+        """显示插件统计信息"""
+        self.logger.section("ComprehendAI 统计信息")
+        self.logger.info(f"总分析次数: {self.analysis_count}")
+        self.logger.info(f"缓存状态: {'启用' if self.use_cache else '禁用'}")
+        self.logger.info(f"自动导出: {'启用' if self.auto_export else '禁用'}")
+        self.logger.info(f"分析深度: {self.disassembler.max_depth}")
+        
+        # 显示缓存统计
+        cache_stats = self.cache_manager.get_stats()
+        self.logger.info(f"缓存条目: {cache_stats['count']}/{cache_stats['max_size']}")
+        
+        # 显示 token 使用情况
+        if self.ai_service.last_token_usage:
+            self.logger.info(f"上次 Token 使用: {self.ai_service.last_token_usage['total_tokens']}")
+    
     def export_last_result(self):
         """导出上次分析结果"""
         if not self.ai_service.last_result:
-            print("❌ 没有可导出的结果")
+            self.logger.error("没有可导出的结果")
             return
         
         func_name = idc.get_func_name(self.last_func_ea) or "unknown"
@@ -913,7 +1207,7 @@ class AnalysisHandler:
         )
         
         if filepath:
-            print(f"✅ 结果已导出到: {filepath}")
+            self.logger.success(f"结果已导出到: {filepath}")
     
     def _create_analysis_prompt(self, disassembly: str, template: str = None) -> str:
         """
@@ -953,21 +1247,23 @@ class AnalysisHandler:
             template_name: 模板名称(仅部分任务类型需要)
         """
         try:
+            self.logger.debug(f"创建任务: {task_type.name}")
+            
             match task_type:
                 case TaskType.ANALYSIS:
                     self._handle_analysis(template_name)
                     
                 case TaskType.CUSTOM_QUERY:
                     if not question:
-                        print("❌ 请提供问题内容")
+                        self.logger.error("请提供问题内容")
                         return
                     self._async_task(question, 0, "")
                     
                 case TaskType.CUSTOM_QUERY_WITH_CODE:
                     if not question:
-                        print("❌ 请提供问题内容")
+                        self.logger.error("请提供问题内容")
                         return
-                    print("📝 正在提取反汇编代码...")
+                    self.logger.info("正在提取反汇编代码...", emoji="📝")
                     disassembly, func_ea = self.disassembler.get_current_function_disasm()
                     self.last_func_ea = func_ea
                     self.last_code = disassembly
@@ -981,10 +1277,9 @@ class AnalysisHandler:
                     self._handle_analysis("VULNERABILITY_SCAN")
                     
         except ValueError as e:
-            print(f"❌ {str(e)}")
+            self.logger.error(str(e))
         except Exception as e:
-            print(f"❌ 创建任务失败: {str(e)}")
-            traceback.print_exc()
+            self.logger.error(f"创建任务失败: {str(e)}", exc_info=True)
     
     def _handle_analysis(self, template_name: str = ""):
         """
@@ -993,32 +1288,36 @@ class AnalysisHandler:
         Args:
             template_name: 模板名称
         """
-        print("📝 正在提取反汇编代码...")
-        disassembly, func_ea = self.disassembler.get_current_function_disasm()
-        self.last_func_ea = func_ea
-        self.last_code = disassembly
-        
-        # 检查缓存
-        if self.use_cache:
-            cached_result = self.cache_manager.get(func_ea, disassembly)
-            if cached_result:
-                print(cached_result)
-                self.ai_service.last_result = cached_result
-                
-                if self.auto_export:
-                    self.export_last_result()
-                
-                return
-        
-        # 创建提示词
-        if template_name:
-            template = PromptTemplates.get_template(template_name)
-            prompt = self._create_analysis_prompt(disassembly, template)
-        else:
-            prompt = self._create_analysis_prompt(disassembly)
-        
-        # 执行分析
-        self._async_task(prompt, func_ea, disassembly)
+        try:
+            disassembly, func_ea = self.disassembler.get_current_function_disasm()
+            self.last_func_ea = func_ea
+            self.last_code = disassembly
+            
+            # 检查缓存
+            if self.use_cache:
+                cached_result = self.cache_manager.get(func_ea, disassembly)
+                if cached_result:
+                    # 直接输出缓存结果
+                    self.logger.section("缓存的分析结果")
+                    print(cached_result)
+                    self.ai_service.last_result = cached_result
+                    
+                    if self.auto_export:
+                        self.export_last_result()
+                    
+                    return
+            
+            # 创建提示词
+            if template_name:
+                template = PromptTemplates.get_template(template_name)
+                prompt = self._create_analysis_prompt(disassembly, template)
+            else:
+                prompt = self._create_analysis_prompt(disassembly)
+            
+            # 执行分析
+            self._async_task(prompt, func_ea, disassembly)
+        except Exception as e:
+            self.logger.error(f"分析任务处理失败: {str(e)}", exc_info=True)
         
     def _async_task(self, prompt: str, func_ea: int = 0, code: str = ""):
         """
@@ -1037,9 +1336,9 @@ class AnalysisHandler:
                 daemon=True  # 设置为守护线程
             )
             task.start()
-            print("🚀 AI 任务已启动...")
+            self.logger.info("AI 任务已启动...", emoji="🚀")
         else:
-            print("❌ 当前 AI 正在处理任务,请稍后尝试或使用 Stop 停止当前任务")
+            self.logger.error("当前 AI 正在处理任务，请稍后尝试或使用 Stop 停止当前任务")
     
     def _run_ai_task(self, prompt: str, func_ea: int, code: str):
         """
@@ -1050,29 +1349,36 @@ class AnalysisHandler:
             func_ea: 函数地址
             code: 代码内容
         """
-        status, result = self.ai_service.ask_ai(
-            prompt, 
-            self.ai_isRunning,
-            func_ea,
-            code,
-            self.use_cache
-        )
-        
-        # 保存到缓存
-        if status == QueryStatus.SUCCESS and result and func_ea and self.use_cache:
-            self.cache_manager.set(func_ea, code, result)
-        
-        # 自动导出
-        if status == QueryStatus.SUCCESS and result and self.auto_export:
-            self.export_last_result()
+        try:
+            status, result = self.ai_service.ask_ai(
+                prompt, 
+                self.ai_isRunning,
+                func_ea,
+                code,
+                self.use_cache
+            )
+            
+            # 更新统计
+            if status == QueryStatus.SUCCESS:
+                self.analysis_count += 1
+            
+            # 保存到缓存
+            if status == QueryStatus.SUCCESS and result and func_ea and self.use_cache:
+                self.cache_manager.set(func_ea, code, result)
+            
+            # 自动导出
+            if status == QueryStatus.SUCCESS and result and self.auto_export:
+                self.export_last_result()
+        except Exception as e:
+            self.logger.error(f"任务执行失败: {str(e)}", exc_info=True)
     
     def stop(self):
         """停止当前 AI 任务"""
         if self.ai_service.stop_event.is_set():
-            print("ℹ️ 没有正在运行的任务")
+            self.logger.info("没有正在运行的任务", emoji="ℹ️")
         else:
             self.ai_service.stop_event.set()
-            print("🛑 正在停止任务...")
+            self.logger.info("正在停止任务...", emoji="🛑")
     
     def choose_template(self) -> Optional[str]:
         """
@@ -1089,12 +1395,13 @@ class AnalysisHandler:
             "5": ("快速总结", "QUICK_SUMMARY"),
         }
         
-        print("\n可用模板:")
+        self.logger.info("\n可用模板:")
         for key, (name, _) in templates.items():
-            print(f"{key}. {name}")
+            self.logger.info(f"{key}. {name}")
         
         choice = idaapi.ask_str("1", 0, "选择模板 (输入数字):")
         if choice and choice in templates:
+            self.logger.debug(f"用户选择模板: {templates[choice][0]}")
             return templates[choice][1]
         
         return None
@@ -1131,12 +1438,14 @@ class ComprehendAIPlugin(idaapi.plugin_t):
         # 缓存管理
         ("AI_analysis:ToggleCache", "🔄 切换缓存", "启用/禁用结果缓存"),
         ("AI_analysis:ClearCache", "🗑️ 清空缓存", "清除所有缓存数据"),
+        ("AI_analysis:ShowCacheStats", "📊 缓存统计", "查看缓存使用统计"),
         
         # 配置
         ("AI_analysis:SetDepth", "⚙️ 分析深度", "设置函数分析递归深度"),
         ("AI_analysis:SetPrompt", "📝 自定义提示词", "自定义分析提示词模板"),
         
-        # 控制
+        # 信息与控制
+        ("AI_analysis:ShowStats", "📈 插件统计", "查看插件使用统计"),
         ("AI_analysis:Stop", "🛑 停止", "停止当前AI任务"),
     ]
 
@@ -1148,6 +1457,9 @@ class ComprehendAIPlugin(idaapi.plugin_t):
             int: PLUGIN_KEEP 保持插件加载
         """
         try:
+            # 初始化日志系统
+            self.logger = Logger()
+            
             # 注册 UI 钩子
             self.ui_hook = self.MenuHook()
             self.ui_hook.hook()
@@ -1158,16 +1470,16 @@ class ComprehendAIPlugin(idaapi.plugin_t):
             # 注册所有动作
             self._register_actions()
             
-            print("=" * 80)
-            print("✅ ComprehendAI 插件已成功加载")
-            print("=" * 80)
+            self.logger.section("ComprehendAI 插件已成功加载")
+            self.logger.info(f"版本: 优化版 v2.0")
+            self.logger.info(f"已注册 {len(self.ACTION_DEFINITIONS)} 个动作")
+            
             return idaapi.PLUGIN_KEEP
             
         except Exception as e:
-            print("=" * 80)
-            print(f"❌ ComprehendAI 插件初始化失败: {str(e)}")
-            print("=" * 80)
-            traceback.print_exc()
+            logger = Logger()
+            logger.section("ComprehendAI 插件初始化失败")
+            logger.error(str(e), exc_info=True)
             return idaapi.PLUGIN_SKIP
 
     def run(self, arg):
@@ -1184,14 +1496,13 @@ class ComprehendAIPlugin(idaapi.plugin_t):
         try:
             self.ui_hook.unhook()
             self._unregister_actions()
-            print("=" * 80)
-            print("👋 ComprehendAI 插件已卸载")
-            print("=" * 80)
+            self.logger.section("ComprehendAI 插件已卸载")
         except Exception as e:
-            print(f"❌ 插件卸载时发生错误: {str(e)}")
+            self.logger.error(f"插件卸载时发生错误: {str(e)}", exc_info=True)
 
     def _register_actions(self):
         """注册所有菜单动作"""
+        success_count = 0
         for action_id, label, tooltip in self.ACTION_DEFINITIONS:
             action_desc = idaapi.action_desc_t(
                 action_id,
@@ -1201,8 +1512,12 @@ class ComprehendAIPlugin(idaapi.plugin_t):
                 tooltip,
                 0
             )
-            if not idaapi.register_action(action_desc):
-                print(f"⚠️ 注册动作失败: {action_id}")
+            if idaapi.register_action(action_desc):
+                success_count += 1
+            else:
+                self.logger.warning(f"注册动作失败: {action_id}")
+        
+        self.logger.debug(f"成功注册 {success_count}/{len(self.ACTION_DEFINITIONS)} 个动作")
 
     def _unregister_actions(self):
         """注销所有菜单动作"""
@@ -1309,6 +1624,9 @@ class ComprehendAIPlugin(idaapi.plugin_t):
                         if idaapi.ask_yn(1, "确定要清空所有缓存吗？") == 1:
                             self.handler.clear_cache()
                     
+                    case "AI_analysis:ShowCacheStats":
+                        self.handler.show_cache_stats()
+                    
                     # 配置
                     case "AI_analysis:SetDepth":
                         current_depth = self.handler.disassembler.max_depth
@@ -1327,15 +1645,17 @@ class ComprehendAIPlugin(idaapi.plugin_t):
                         )
                         if new_prompt:
                             self.handler.prompt = new_prompt
-                            print("✅ 提示词模板已更新")
+                            self.handler.logger.success("提示词模板已更新")
                     
-                    # 控制
+                    # 信息与控制
+                    case "AI_analysis:ShowStats":
+                        self.handler.show_stats()
+                    
                     case "AI_analysis:Stop":
                         self.handler.stop()
                         
             except Exception as e:
-                print(f"❌ 执行操作失败: {str(e)}")
-                traceback.print_exc()
+                Logger().error(f"执行操作失败: {str(e)}", exc_info=True)
                 
             return 1
 
